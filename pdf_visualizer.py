@@ -10,6 +10,18 @@ class PDFVisualizer:
         self.pdf_path = pdf_path
         self.doc = fitz.open(pdf_path)
         self.font_stats = self._analyze_font_statistics()
+        self.custom_exclude_boxes = []  # 사용자 정의 제외 영역 (머리말, 페이지 번호, 인덱스 등)
+        self.block_positions = {}  # 페이지별 블럭 위치 통계
+        self.block_types = {
+            "title": (1, 0, 0),       # 빨간색 (기존과 동일)
+            "body": (0, 0, 1),        # 파란색 (기존과 동일)
+            "header": (0, 0.5, 0),    # 녹색
+            "footer": (1, 0.5, 0),    # 주황색
+            "page_number": (0.5, 0, 0.5),  # 자주색
+            "index": (0.6, 0.3, 0),   # 갈색
+            "exclude": (0.5, 0, 0.5)  # 보라색 (제외 영역)
+        }
+        self._analyze_block_positions()
     
     def _analyze_font_statistics(self) -> Dict[str, Any]:
         """문서 전체의 폰트 통계 분석"""
@@ -53,18 +65,36 @@ class PDFVisualizer:
         text = block["text"].strip()
         font_size = block["font_size"]
         
-        # 패턴 기반 체크
+        # 텍스트가 너무 길면 제목이 아닐 가능성이 높음
+        if len(text) > 150:
+            return False
+        
+        # 패턴 기반 체크 (강한 제목 패턴)
         if re.match(r'^제\d+[장절]', text) or re.match(r'^[0-9]+[\.\s]', text):
+            # 숫자로 시작하는 경우, 제목은 일반적으로 30자 이내
+            if re.match(r'^[0-9]+[\.\s]', text) and len(text) > 100:
+                return False
             return True
-            
-        # 폰트 크기 기반 체크
-        if font_size > self.font_stats["body_size"] * 1.2:
+        
+        # 폰트 크기 기반 체크 (더 엄격한 기준 적용)
+        body_size = self.font_stats["body_size"]
+        
+        # 폰트 크기가 본문보다 충분히 큰 경우에만 제목으로 간주 (1.2배 -> 1.5배)
+        if font_size > body_size * 1.5:
+            # 폰트가 크더라도 텍스트가 길면 제목이 아닐 가능성이 높음
+            if len(text) > 70:
+                return False
             return True
-            
+        
         # 특수 케이스: 대문자나 굵은 글씨체로 짧은 텍스트
-        if len(text) < 100 and (text.isupper() or "bold" in block["font_name"].lower()):
-            return True
-            
+        if len(text) < 50 and (text.isupper() or "bold" in block["font_name"].lower()):
+            # Bold 폰트이면서 본문보다 약간 큰 경우 (1.1배 이상)
+            if "bold" in block["font_name"].lower() and font_size > body_size * 1.1:
+                return True
+            # 모두 대문자인 경우 (일반적으로 짧은 헤딩)
+            if text.isupper() and len(text) < 25:
+                return True
+        
         return False
     
     def _is_complete_sentence(self, text: str) -> bool:
@@ -169,7 +199,245 @@ class PDFVisualizer:
             
         return True
     
-    def extract_blocks(self, merge_blocks: bool = True, merge_overlapping: bool = True) -> List[Dict[str, Any]]:
+    def add_exclude_box(self, page_num: int, bbox: Tuple[float, float, float, float], description: str = ""):
+        """
+        머리말, 페이지 번호, 인덱스 등을 제거하기 위한 사용자 정의 제외 영역 추가
+        
+        Args:
+            page_num: 페이지 번호 (1부터 시작)
+            bbox: 제외할 영역의 바운딩 박스 (x0, y0, x1, y1)
+            description: 제외 영역에 대한 설명 (선택 사항)
+        """
+        self.custom_exclude_boxes.append({
+            "page": page_num,
+            "bbox": bbox,
+            "description": description
+        })
+        return len(self.custom_exclude_boxes) - 1  # 추가된 제외 영역의 인덱스 반환
+    
+    def remove_exclude_box(self, index: int):
+        """
+        지정된 인덱스의 제외 영역을 제거
+        """
+        if 0 <= index < len(self.custom_exclude_boxes):
+            self.custom_exclude_boxes.pop(index)
+            return True
+        return False
+    
+    def clear_exclude_boxes(self):
+        """
+        모든 제외 영역 초기화
+        """
+        self.custom_exclude_boxes = []
+    
+    def _analyze_block_positions(self):
+        """모든 페이지의 블럭 위치 통계 분석"""
+        # 페이지별 상단 및 하단 블럭 수집
+        top_blocks = []
+        bottom_blocks = []
+        page_numbers = []
+        
+        for page_num in range(len(self.doc)):
+            page = self.doc[page_num]
+            page_height = page.rect.height
+            page_width = page.rect.width
+            blocks_dict = page.get_text("dict")["blocks"]
+            
+            for block in blocks_dict:
+                if "lines" not in block:
+                    continue
+                
+                # 텍스트 추출
+                text_parts = []
+                first_span = None
+                
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        if not first_span:
+                            first_span = span
+                        text_parts.append(span["text"])
+                
+                if not text_parts or not first_span:
+                    continue
+                    
+                text = " ".join(text_parts).strip()
+                if not text:
+                    continue
+                
+                # 상대적 위치 계산
+                y_rel_top = block["bbox"][1] / page_height
+                y_rel_bottom = block["bbox"][3] / page_height
+                x_rel_left = block["bbox"][0] / page_width
+                x_rel_right = block["bbox"][2] / page_width
+                
+                # 상단 10% 영역의 블럭
+                if y_rel_top < 0.1:
+                    top_blocks.append({
+                        "page": page_num + 1,
+                        "text": text,
+                        "y_rel": y_rel_top,
+                        "x_rel_left": x_rel_left,
+                        "x_rel_right": x_rel_right,
+                        "font_size": first_span["size"]
+                    })
+                
+                # 하단 10% 영역의 블럭
+                if y_rel_bottom > 0.9:
+                    bottom_blocks.append({
+                        "page": page_num + 1,
+                        "text": text,
+                        "y_rel": y_rel_bottom,
+                        "x_rel_left": x_rel_left,
+                        "x_rel_right": x_rel_right,
+                        "font_size": first_span["size"]
+                    })
+                
+                # 페이지 번호 후보 (짧은 숫자 텍스트, 주로 모서리에 위치)
+                if len(text) <= 5 and text.replace('.', '').isdigit():
+                    # 모서리에 위치한 경우 (왼쪽 하단, 오른쪽 하단, 오른쪽 상단)
+                    is_corner = (x_rel_left < 0.15 and y_rel_bottom > 0.85) or \
+                                (x_rel_right > 0.85 and y_rel_bottom > 0.85) or \
+                                (x_rel_right > 0.85 and y_rel_top < 0.15)
+                    if is_corner:
+                        page_numbers.append({
+                            "page": page_num + 1,
+                            "text": text,
+                            "y_rel": y_rel_top if y_rel_top < 0.15 else y_rel_bottom,
+                            "x_rel_left": x_rel_left,
+                            "x_rel_right": x_rel_right
+                        })
+        
+        # 머리말 패턴 찾기 (여러 페이지에 걸쳐 유사한 y좌표와 내용을 가진 상단 블럭)
+        headers = self._find_repeating_blocks(top_blocks)
+        
+        # 꼬리말 패턴 찾기 (여러 페이지에 걸쳐 유사한 y좌표와 내용을 가진 하단 블럭)
+        footers = self._find_repeating_blocks(bottom_blocks)
+        
+        # 결과 저장
+        self.block_positions = {
+            "headers": headers,
+            "footers": footers,
+            "page_numbers": page_numbers
+        }
+        
+        print(f"머리말: {len(headers)}개, 꼬리말: {len(footers)}개, 페이지 번호: {len(page_numbers)}개 식별됨")
+    
+    def _find_repeating_blocks(self, blocks):
+        """여러 페이지에 걸쳐 반복되는 블럭 패턴 찾기"""
+        if not blocks:
+            return []
+            
+        # y 좌표별로 그룹화
+        y_groups = {}
+        for block in blocks:
+            y_key = round(block["y_rel"], 2)  # 2자리 반올림으로 유사한 y좌표 그룹화
+            if y_key not in y_groups:
+                y_groups[y_key] = []
+            y_groups[y_key].append(block)
+        
+        # 3페이지 이상에 나타나는 패턴 찾기
+        repeating_blocks = []
+        for y_key, group in y_groups.items():
+            if len(set(block["page"] for block in group)) >= 3:  # 3페이지 이상 등장
+                # 각 페이지별로 하나씩만 선택
+                seen_pages = set()
+                filtered_group = []
+                for block in group:
+                    if block["page"] not in seen_pages:
+                        seen_pages.add(block["page"])
+                        filtered_group.append(block)
+                
+                repeating_blocks.extend(filtered_group)
+        
+        return repeating_blocks
+    
+    def _classify_block_type(self, block):
+        """블럭 유형 분류 (제목, 본문, 머리말, 꼬리말, 페이지 번호, 인덱스)"""
+        # 이미 제목으로 분류되었다면 추가 검증
+        if block["is_title"]:
+            text = block["text"]
+            # 제목으로 분류되었지만 텍스트가 매우 길거나 마침표가 많은 경우 본문일 가능성이 높음
+            if len(text) > 100 or text.count('.') > 3:
+                if not re.match(r'^제\d+[장절]', text) and not re.match(r'^\d+[\.\s]', text):
+                    return "body"
+            
+            # 괄호나 콜론이 있고 설명이 긴 경우 본문일 가능성이 높음
+            if ('(' in text and ')' in text) or ':' in text:
+                if len(text) > 80:
+                    return "body"
+            
+            return "title"
+        
+        page_num = block["page"]
+        text = block["text"]
+        bbox = block["bbox"]
+        
+        # 페이지 크기 가져오기
+        page = self.doc[page_num - 1]
+        page_height = page.rect.height
+        page_width = page.rect.width
+        
+        # 상대적 위치 계산
+        y_rel_top = bbox[1] / page_height
+        y_rel_bottom = bbox[3] / page_height
+        x_rel_left = bbox[0] / page_width
+        x_rel_right = bbox[2] / page_width
+        
+        # 세로로 긴 텍스트 블럭 인식 (Y 사이즈만 크게 증가한 경우)
+        block_width = bbox[2] - bbox[0]
+        block_height = bbox[3] - bbox[1]
+        aspect_ratio = block_height / block_width if block_width > 0 else 0
+        
+        # 이미지에서 보이는 것처럼 세로로 긴 블럭(종횡비가 높음)이면 인덱스로 간주
+        if aspect_ratio > 3.0 and block_width < page_width * 0.15:
+            return "index"
+        
+        # 1. 페이지 번호 확인
+        if len(text) <= 5 and text.replace('.', '').isdigit():
+            # 모서리에 위치한 경우 (왼쪽 하단, 오른쪽 하단, 오른쪽 상단)
+            is_corner = (x_rel_left < 0.15 and y_rel_bottom > 0.85) or \
+                        (x_rel_right > 0.85 and y_rel_bottom > 0.85) or \
+                        (x_rel_right > 0.85 and y_rel_top < 0.15)
+            if is_corner:
+                return "page_number"
+        
+        # 2. 머리말 확인 (상단 10% 영역)
+        if y_rel_top < 0.1:
+            # 통계에서 식별된 머리말과 비교
+            for header in self.block_positions.get("headers", []):
+                if abs(y_rel_top - header["y_rel"]) < 0.02:  # y좌표가 유사함
+                    return "header"
+        
+        # 3. 꼬리말 확인 (하단 10% 영역)
+        if y_rel_bottom > 0.9:
+            # 통계에서 식별된 꼬리말과 비교
+            for footer in self.block_positions.get("footers", []):
+                if abs(y_rel_bottom - footer["y_rel"]) < 0.02:  # y좌표가 유사함
+                    return "footer"
+        
+        # 4. 인덱스/목차 패턴 확인
+        index_pattern = re.compile(r'^\d+[\.\s].*\d+$')  # 숫자로 시작하고 숫자로 끝나는 패턴 (예: "1. 제목 ... 123")
+        if index_pattern.match(text) and '.' in text:
+            dot_pos = text.find('.')
+            if dot_pos > 0 and dot_pos < len(text) - 1:
+                # 앞부분은 숫자, 뒷부분 끝이 숫자인지 확인
+                prefix = text[:dot_pos]
+                if prefix.isdigit() and any(c.isdigit() for c in text[-5:]):
+                    return "index"
+        
+        # 5. 본문 추가 확인 (본문 특성)
+        # 긴 텍스트, 마침표가 많은 경우, 괄호나 콜론이 있는 설명적 텍스트
+        if len(text) > 80 or text.count('.') > 2 or text.count(',') > 2:
+            return "body"
+        
+        # 문장이 완전한 형태인 경우 (마침표, 물음표, 느낌표로 끝나는 경우)
+        if self._is_complete_sentence(text):
+            return "body"
+        
+        # 기본값은 본문
+        return "body"
+    
+    def extract_blocks(self, merge_blocks: bool = True, merge_overlapping: bool = True, apply_exclusions: bool = True) -> List[Dict[str, Any]]:
         """PDF에서 텍스트 블록 추출"""
         all_blocks = []
         
@@ -195,14 +463,38 @@ class PDFVisualizer:
                 if text_parts and first_span:
                     text = " ".join(text_parts).strip()
                     if text:
-                        all_blocks.append({
+                        block_info = {
                             "page": page_num + 1,
                             "text": text,
                             "bbox": block["bbox"],
                             "font_size": first_span["size"],
                             "font_name": first_span["font"],
-                            "is_title": False  # 일단 False로 초기화
-                        })
+                            "is_title": False,  # 일단 False로 초기화
+                            "block_type": "body"  # 기본 유형은 본문
+                        }
+                        
+                        # 제외 영역 적용 여부 확인
+                        if apply_exclusions:
+                            should_include = True
+                            for exclude_box in self.custom_exclude_boxes:
+                                if exclude_box["page"] == block_info["page"]:
+                                    # 바운딩 박스 교차 여부 확인
+                                    exclude_rect = fitz.Rect(exclude_box["bbox"])
+                                    block_rect = fitz.Rect(block_info["bbox"])
+                                    if exclude_rect.intersects(block_rect):
+                                        # 50% 이상 겹치는 경우에만 제외
+                                        intersection = exclude_rect.intersect(block_rect)
+                                        block_area = block_rect.width * block_rect.height
+                                        if block_area > 0:
+                                            overlap_ratio = (intersection.width * intersection.height) / block_area
+                                            if overlap_ratio > 0.5:  # 50% 이상 겹치면 제외
+                                                should_include = False
+                                                break
+                            
+                            if should_include:
+                                all_blocks.append(block_info)
+                        else:
+                            all_blocks.append(block_info)
         
         # 제목 식별
         for block in all_blocks:
@@ -259,11 +551,19 @@ class PDFVisualizer:
                     else:
                         i += 1
             
+            # 블럭 유형 분류
+            for block in merged_blocks:
+                block["block_type"] = self._classify_block_type(block)
+            
             return merged_blocks
+        
+        # 블럭 유형 분류
+        for block in all_blocks:
+            block["block_type"] = self._classify_block_type(block)
         
         return all_blocks
     
-    def visualize_blocks(self, output_dir: str):
+    def visualize_blocks(self, output_dir: str, show_exclude_boxes: bool = True):
         """텍스트 블록의 바운딩 박스를 시각화"""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -288,13 +588,34 @@ class PDFVisualizer:
                 if block["page"] == page_num + 1:
                     rect = fitz.Rect(block["bbox"])
                     
-                    # 제목은 빨간색, 본문은 파란색으로 표시
+                    # 블럭 유형에 따라 색상 결정
+                    block_type = block["block_type"]
+                    color = self.block_types.get(block_type, (0, 0, 1))  # 기본은 파란색
+                    
+                    # 제목이 우선순위가 높음
                     if block["is_title"]:
-                        color = (1, 0, 0)  # 빨간색
-                    else:
-                        color = (0, 0, 1)  # 파란색
+                        color = self.block_types["title"]
                         
                     page.draw_rect(rect, color=color)
+                    
+                    # 블럭 유형 표시 (선택 사항)
+                    text_point = fitz.Point(rect.x0, rect.y0 - 2)
+                    page.insert_text(text_point, block_type, 
+                                    color=color, fontsize=6)
+            
+            # 제외 영역 보라색으로 표시
+            if show_exclude_boxes:
+                for exclude_box in self.custom_exclude_boxes:
+                    if exclude_box["page"] == page_num + 1:
+                        rect = fitz.Rect(exclude_box["bbox"])
+                        color = self.block_types["exclude"]
+                        page.draw_rect(rect, color=color, width=2)
+                        
+                        # 제외 영역에 설명 추가 (선택 사항)
+                        if exclude_box["description"]:
+                            text_point = fitz.Point(rect.x0, rect.y0 - 5)
+                            page.insert_text(text_point, exclude_box["description"], 
+                                            color=color, fontsize=8)
             
             # 바운딩 박스가 그려진 이미지 저장
             image_path = output_dir / f"page_{page_num + 1}_with_boxes.png"
@@ -325,22 +646,48 @@ class PDFVisualizer:
 
 def main():
     # 예시 사용법
-    pdf_path = "./data/pdf/연말정산-1-14.pdf"
+    pdf_path = "./data/pdf/연말정산.pdf"
     output_dir = "./output/visualization"
     
     visualizer = PDFVisualizer(pdf_path)
     
     try:
-        # 블록 추출 (겹치는 블록 병합 포함)
-        blocks = visualizer.extract_blocks(merge_blocks=True, merge_overlapping=True)
+        # 예시: 제외 영역 추가 (머리말, 페이지 번호)
+        # 1페이지 상단 헤더 영역
+        visualizer.add_exclude_box(1, (50, 20, 550, 80), "헤더")
+        # 모든 페이지 하단 페이지 번호 영역
+        for page_num in range(1, len(visualizer.doc) + 1):
+            visualizer.add_exclude_box(page_num, (500, 750, 550, 780), f"페이지 {page_num}")
         
-        # JSON으로 저장
-        visualizer.save_blocks_to_json(blocks, "./output/blocks_merged.json")
+        # 원본 블록 추출 (병합 없이)
+        original_blocks = visualizer.extract_blocks(merge_blocks=False, merge_overlapping=False, apply_exclusions=True)
         
-        # 시각화 (제목과 본문 구분하여 표시)
-        visualizer.visualize_blocks(output_dir)
+        # 원본 블록 JSON으로 저장
+        visualizer.save_blocks_to_json(original_blocks, "./output/blocks_original.json")
+        print(f"원본 블록 {len(original_blocks)}개가 blocks_original.json에 저장되었습니다.")
         
-        print(f"총 {len(blocks)}개의 텍스트 블록을 추출했습니다.")
+        # 병합된 블록 추출
+        merged_blocks = visualizer.extract_blocks(merge_blocks=True, merge_overlapping=True, apply_exclusions=True)
+        
+        # 블록 유형 통계 출력
+        block_type_count = {}
+        for block in merged_blocks:
+            block_type = block["block_type"]
+            if block_type not in block_type_count:
+                block_type_count[block_type] = 0
+            block_type_count[block_type] += 1
+        
+        print("블록 유형 통계:")
+        for block_type, count in block_type_count.items():
+            print(f"  - {block_type}: {count}개")
+        
+        # 병합된 블록 JSON으로 저장
+        visualizer.save_blocks_to_json(merged_blocks, "./output/blocks_merged.json")
+        
+        # 시각화 (블록 유형별로 다른 색상 적용)
+        visualizer.visualize_blocks(output_dir, show_exclude_boxes=True)
+        
+        print(f"총 {len(merged_blocks)}개의 병합된 텍스트 블록을 추출했습니다.")
         print(f"결과가 {output_dir} 디렉토리에 저장되었습니다.")
         
     finally:
