@@ -81,6 +81,65 @@ class PDFVisualizer:
             
         return False
     
+    def _is_vertically_overlapping(self, block1: Dict, block2: Dict) -> bool:
+        """두 블록이 수직으로 겹치는지 확인"""
+        y1_top, y1_bottom = block1["bbox"][1], block1["bbox"][3]
+        y2_top, y2_bottom = block2["bbox"][1], block2["bbox"][3]
+        
+        # 수직 겹침 계산
+        y_overlap = min(y1_bottom, y2_bottom) - max(y1_top, y2_top)
+        
+        return y_overlap > 0
+    
+    def _is_content_related(self, block1: Dict, block2: Dict) -> bool:
+        """두 블록이 내용적으로 연관되어 있는지 확인"""
+        text1, text2 = block1["text"].strip(), block2["text"].strip()
+        
+        # 블록2가 괄호로 시작하고 블록1이 제목인 경우 (법령 참조)
+        if text2.startswith("(") and block1["is_title"]:
+            return True
+        
+        # 블록2가 법률 참조 형식인 경우
+        if re.match(r'^\((?:소득|조특|법인|부가가치|상속|증여)(?:법|령)\s+제\d+조', text2):
+            return True
+            
+        # 블록2가 적용시기 형식인 경우
+        if text2.startswith("적용시기") or text2.startswith("<적용시기"):
+            return True
+        
+        # 폰트 유사성 확인
+        font_size_diff = abs(block1["font_size"] - block2["font_size"])
+        if block1["font_name"] == block2["font_name"] and font_size_diff < 5:
+            # 두 블록 모두 제목이거나 둘 다 제목이 아님
+            if block1["is_title"] == block2["is_title"]:
+                return True
+        
+        return False
+    
+    def _should_merge_overlapping_blocks(self, block1: Dict, block2: Dict) -> bool:
+        """겹치는 블록을 병합해야 하는지 판단"""
+        # 같은 페이지에 있는지 확인
+        if block1["page"] != block2["page"]:
+            return False
+        
+        # 수직 겹침 확인
+        if not self._is_vertically_overlapping(block1, block2):
+            return False
+        
+        # 내용적 연관성 확인
+        if not self._is_content_related(block1, block2):
+            return False
+        
+        # x좌표 범위 겹침 확인
+        x1_left, x1_right = block1["bbox"][0], block1["bbox"][2]
+        x2_left, x2_right = block2["bbox"][0], block2["bbox"][2]
+        x_overlap = min(x1_right, x2_right) - max(x1_left, x2_left)
+        
+        if x_overlap <= 0:
+            return False
+        
+        return True
+    
     def _should_merge_blocks(self, current: Dict, next_block: Dict) -> bool:
         """두 블록을 병합해야 하는지 판단"""
         # 같은 페이지가 아니면 병합하지 않음
@@ -110,7 +169,7 @@ class PDFVisualizer:
             
         return True
     
-    def extract_blocks(self, merge_blocks: bool = True) -> List[Dict[str, Any]]:
+    def extract_blocks(self, merge_blocks: bool = True, merge_overlapping: bool = True) -> List[Dict[str, Any]]:
         """PDF에서 텍스트 블록 추출"""
         all_blocks = []
         
@@ -173,6 +232,33 @@ class PDFVisualizer:
                     current = next_block.copy()
             
             merged_blocks.append(current)
+            
+            # 겹치는 블록 병합
+            if merge_overlapping:
+                i = 0
+                while i < len(merged_blocks) - 1:
+                    if self._should_merge_overlapping_blocks(merged_blocks[i], merged_blocks[i+1]):
+                        # 텍스트 병합 (제목 + 부제목)
+                        if merged_blocks[i+1]["text"].strip().startswith("("):
+                            # 괄호로 시작하는 경우 공백 추가
+                            merged_blocks[i]["text"] = merged_blocks[i]["text"] + " " + merged_blocks[i+1]["text"]
+                        else:
+                            # 그 외에는 줄바꿈 추가
+                            merged_blocks[i]["text"] = merged_blocks[i]["text"] + "\n" + merged_blocks[i+1]["text"]
+                        
+                        # 바운딩 박스 확장
+                        merged_blocks[i]["bbox"] = (
+                            min(merged_blocks[i]["bbox"][0], merged_blocks[i+1]["bbox"][0]),
+                            min(merged_blocks[i]["bbox"][1], merged_blocks[i+1]["bbox"][1]),
+                            max(merged_blocks[i]["bbox"][2], merged_blocks[i+1]["bbox"][2]),
+                            max(merged_blocks[i]["bbox"][3], merged_blocks[i+1]["bbox"][3])
+                        )
+                        
+                        # 병합된 블록 제거
+                        merged_blocks.pop(i+1)
+                    else:
+                        i += 1
+            
             return merged_blocks
         
         return all_blocks
@@ -182,8 +268,8 @@ class PDFVisualizer:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 블록 추출
-        blocks = self.extract_blocks()
+        # 블록 추출 (겹치는 블록 병합 포함)
+        blocks = self.extract_blocks(merge_blocks=True, merge_overlapping=True)
         
         for page_num in range(len(self.doc)):
             page = self.doc[page_num]
@@ -245,8 +331,8 @@ def main():
     visualizer = PDFVisualizer(pdf_path)
     
     try:
-        # 블록 추출 (폰트 크기 기반 병합)
-        blocks = visualizer.extract_blocks(merge_blocks=True)
+        # 블록 추출 (겹치는 블록 병합 포함)
+        blocks = visualizer.extract_blocks(merge_blocks=True, merge_overlapping=True)
         
         # JSON으로 저장
         visualizer.save_blocks_to_json(blocks, "./output/blocks_merged.json")
