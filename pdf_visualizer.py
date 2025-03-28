@@ -13,16 +13,34 @@ class PDFVisualizer:
         if not blocks:
             return blocks
             
+        # 페이지, y좌표, x좌표 순으로 정렬
+        blocks.sort(key=lambda x: (x["page"], x["bbox"][1], x["bbox"][0]))
+        
         merged = []
         current = blocks[0].copy()
         
         for next_block in blocks[1:]:
-            # 폰트 크기가 11 이하인 블록들을 병합
-            if (current["font_size"] <= 11 and next_block["font_size"] <= 11 and
-                abs(current["bbox"][3] - next_block["bbox"][1]) < 5):  # 수직 간격이 5 이하
+            # 같은 페이지의 블록만 병합
+            if current["page"] != next_block["page"]:
+                merged.append(current)
+                current = next_block.copy()
+                continue
                 
-                # 텍스트 병합 (줄바꿈 추가)
-                current["text"] += "\n" + next_block["text"]
+            # 폰트 크기가 11 이하이고 본문으로 보이는 텍스트만 병합
+            is_body_text = (
+                current["font_size"] <= 11 and 
+                next_block["font_size"] <= 11 and
+                not any(current["text"].startswith(prefix) for prefix in ["제", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]) and
+                not any(next_block["text"].startswith(prefix) for prefix in ["제", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
+            )
+            
+            # y좌표 차이가 글자 크기의 1.5배 이하인 경우 병합
+            y_diff = abs(current["bbox"][3] - next_block["bbox"][1])
+            max_y_diff = max(current["font_size"], next_block["font_size"]) * 1.5
+            
+            if is_body_text and y_diff <= max_y_diff:
+                # 텍스트 병합 (공백으로 구분)
+                current["text"] += " " + next_block["text"]
                 # 바운딩 박스 확장
                 current["bbox"] = (
                     min(current["bbox"][0], next_block["bbox"][0]),  # x0
