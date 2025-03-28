@@ -10,7 +10,6 @@ class PDFVisualizer:
         self.pdf_path = pdf_path
         self.doc = fitz.open(pdf_path)
         self.font_stats = self._analyze_font_statistics()
-        self.custom_exclude_boxes = []  # 사용자 정의 제외 영역 (머리말, 페이지 번호, 인덱스 등)
         self.block_positions = {}  # 페이지별 블럭 위치 통계
         self.block_types = {
             "title": (1, 0, 0),       # 빨간색 (기존과 동일)
@@ -18,8 +17,7 @@ class PDFVisualizer:
             "header": (0, 0.5, 0),    # 녹색
             "footer": (1, 0.5, 0),    # 주황색
             "page_number": (0.5, 0, 0.5),  # 자주색
-            "index": (0.6, 0.3, 0),   # 갈색
-            "exclude": (0.5, 0, 0.5)  # 보라색 (제외 영역)
+            "index": (0.6, 0.3, 0)    # 갈색
         }
         self._analyze_block_positions()
     
@@ -198,37 +196,6 @@ class PDFVisualizer:
             return False
             
         return True
-    
-    def add_exclude_box(self, page_num: int, bbox: Tuple[float, float, float, float], description: str = ""):
-        """
-        머리말, 페이지 번호, 인덱스 등을 제거하기 위한 사용자 정의 제외 영역 추가
-        
-        Args:
-            page_num: 페이지 번호 (1부터 시작)
-            bbox: 제외할 영역의 바운딩 박스 (x0, y0, x1, y1)
-            description: 제외 영역에 대한 설명 (선택 사항)
-        """
-        self.custom_exclude_boxes.append({
-            "page": page_num,
-            "bbox": bbox,
-            "description": description
-        })
-        return len(self.custom_exclude_boxes) - 1  # 추가된 제외 영역의 인덱스 반환
-    
-    def remove_exclude_box(self, index: int):
-        """
-        지정된 인덱스의 제외 영역을 제거
-        """
-        if 0 <= index < len(self.custom_exclude_boxes):
-            self.custom_exclude_boxes.pop(index)
-            return True
-        return False
-    
-    def clear_exclude_boxes(self):
-        """
-        모든 제외 영역 초기화
-        """
-        self.custom_exclude_boxes = []
     
     def _analyze_block_positions(self):
         """모든 페이지의 블럭 위치 통계 분석"""
@@ -437,7 +404,7 @@ class PDFVisualizer:
         # 기본값은 본문
         return "body"
     
-    def extract_blocks(self, merge_blocks: bool = True, merge_overlapping: bool = True, apply_exclusions: bool = True) -> List[Dict[str, Any]]:
+    def extract_blocks(self, merge_blocks: bool = True, merge_overlapping: bool = True) -> List[Dict[str, Any]]:
         """PDF에서 텍스트 블록 추출"""
         all_blocks = []
         
@@ -472,29 +439,7 @@ class PDFVisualizer:
                             "is_title": False,  # 일단 False로 초기화
                             "block_type": "body"  # 기본 유형은 본문
                         }
-                        
-                        # 제외 영역 적용 여부 확인
-                        if apply_exclusions:
-                            should_include = True
-                            for exclude_box in self.custom_exclude_boxes:
-                                if exclude_box["page"] == block_info["page"]:
-                                    # 바운딩 박스 교차 여부 확인
-                                    exclude_rect = fitz.Rect(exclude_box["bbox"])
-                                    block_rect = fitz.Rect(block_info["bbox"])
-                                    if exclude_rect.intersects(block_rect):
-                                        # 50% 이상 겹치는 경우에만 제외
-                                        intersection = exclude_rect.intersect(block_rect)
-                                        block_area = block_rect.width * block_rect.height
-                                        if block_area > 0:
-                                            overlap_ratio = (intersection.width * intersection.height) / block_area
-                                            if overlap_ratio > 0.5:  # 50% 이상 겹치면 제외
-                                                should_include = False
-                                                break
-                            
-                            if should_include:
-                                all_blocks.append(block_info)
-                        else:
-                            all_blocks.append(block_info)
+                        all_blocks.append(block_info)
         
         # 제목 식별
         for block in all_blocks:
@@ -563,13 +508,14 @@ class PDFVisualizer:
         
         return all_blocks
     
-    def visualize_blocks(self, output_dir: str, show_exclude_boxes: bool = True):
+    def visualize_blocks(self, output_dir: str, blocks=None, suffix="", is_original=False):
         """텍스트 블록의 바운딩 박스를 시각화"""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 블록 추출 (겹치는 블록 병합 포함)
-        blocks = self.extract_blocks(merge_blocks=True, merge_overlapping=True)
+        # 지정된 블록이 없으면 추출
+        if blocks is None:
+            blocks = self.extract_blocks(merge_blocks=True, merge_overlapping=True)
         
         for page_num in range(len(self.doc)):
             page = self.doc[page_num]
@@ -579,46 +525,39 @@ class PDFVisualizer:
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat)
             
-            # 원본 이미지 저장
-            image_path = output_dir / f"page_{page_num + 1}.png"
-            pix.save(str(image_path))
+            # 원본 이미지 저장 (접미사가 없는 경우에만 저장)
+            if not suffix:
+                image_path = output_dir / f"page_{page_num + 1}.png"
+                pix.save(str(image_path))
             
             # 바운딩 박스 그리기
             for block in blocks:
                 if block["page"] == page_num + 1:
                     rect = fitz.Rect(block["bbox"])
                     
-                    # 블럭 유형에 따라 색상 결정
-                    block_type = block["block_type"]
-                    color = self.block_types.get(block_type, (0, 0, 1))  # 기본은 파란색
-                    
-                    # 제목이 우선순위가 높음
-                    if block["is_title"]:
-                        color = self.block_types["title"]
+                    if is_original:
+                        # 원본 블록은 모두 동일한 색상(초록색)으로 표시
+                        color = (0, 0.7, 0)
+                        page.draw_rect(rect, color=color, width=1)
+                    else:
+                        # 병합된 블록은 유형에 따라 색상 결정
+                        block_type = block["block_type"]
+                        color = self.block_types.get(block_type, (0, 0, 1))  # 기본은 파란색
                         
-                    page.draw_rect(rect, color=color)
-                    
-                    # 블럭 유형 표시 (선택 사항)
-                    text_point = fitz.Point(rect.x0, rect.y0 - 2)
-                    page.insert_text(text_point, block_type, 
-                                    color=color, fontsize=6)
-            
-            # 제외 영역 보라색으로 표시
-            if show_exclude_boxes:
-                for exclude_box in self.custom_exclude_boxes:
-                    if exclude_box["page"] == page_num + 1:
-                        rect = fitz.Rect(exclude_box["bbox"])
-                        color = self.block_types["exclude"]
-                        page.draw_rect(rect, color=color, width=2)
+                        # 제목이 우선순위가 높음
+                        if block["is_title"]:
+                            color = self.block_types["title"]
+                            
+                        page.draw_rect(rect, color=color)
                         
-                        # 제외 영역에 설명 추가 (선택 사항)
-                        if exclude_box["description"]:
-                            text_point = fitz.Point(rect.x0, rect.y0 - 5)
-                            page.insert_text(text_point, exclude_box["description"], 
-                                            color=color, fontsize=8)
+                        # 블럭 유형 표시 (병합된 블록에만 적용)
+                        text_point = fitz.Point(rect.x0, rect.y0 - 2)
+                        page.insert_text(text_point, block_type, 
+                                        color=color, fontsize=6)
             
-            # 바운딩 박스가 그려진 이미지 저장
-            image_path = output_dir / f"page_{page_num + 1}_with_boxes.png"
+            # 바운딩 박스가 그려진 이미지 저장 (접미사 추가)
+            file_name = f"page_{page_num + 1}_with_boxes{suffix}.png"
+            image_path = output_dir / file_name
             pix = page.get_pixmap(matrix=mat)
             pix.save(str(image_path))
     
@@ -640,6 +579,43 @@ class PDFVisualizer:
                 "font_stats": self.font_stats
             }, f, ensure_ascii=False, indent=2)
     
+    def extract_raw_blocks(self) -> List[Dict[str, Any]]:
+        """어노테이션 없이 PDF에서 원본 텍스트 블록만 추출"""
+        all_blocks = []
+        
+        # 모든 페이지에서 블록 추출
+        for page_num in range(len(self.doc)):
+            page = self.doc[page_num]
+            blocks_dict = page.get_text("dict")["blocks"]
+            
+            for block in blocks_dict:
+                if "lines" not in block:
+                    continue
+                
+                # 각 블록의 텍스트와 속성 추출
+                text_parts = []
+                first_span = None
+                
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        if not first_span:
+                            first_span = span
+                        text_parts.append(span["text"])
+                
+                if text_parts and first_span:
+                    text = " ".join(text_parts).strip()
+                    if text:
+                        block_info = {
+                            "page": page_num + 1,
+                            "text": text,
+                            "bbox": block["bbox"],
+                            "font_size": first_span["size"],
+                            "font_name": first_span["font"]
+                        }
+                        all_blocks.append(block_info)
+        
+        return all_blocks
+    
     def close(self):
         """PDF 문서 닫기"""
         self.doc.close()
@@ -652,22 +628,19 @@ def main():
     visualizer = PDFVisualizer(pdf_path)
     
     try:
-        # 예시: 제외 영역 추가 (머리말, 페이지 번호)
-        # 1페이지 상단 헤더 영역
-        visualizer.add_exclude_box(1, (50, 20, 550, 80), "헤더")
-        # 모든 페이지 하단 페이지 번호 영역
-        for page_num in range(1, len(visualizer.doc) + 1):
-            visualizer.add_exclude_box(page_num, (500, 750, 550, 780), f"페이지 {page_num}")
-        
-        # 원본 블록 추출 (병합 없이)
-        original_blocks = visualizer.extract_blocks(merge_blocks=False, merge_overlapping=False, apply_exclusions=True)
+        # 원본 블록 추출 (어노테이션 없이)
+        original_blocks = visualizer.extract_raw_blocks()
         
         # 원본 블록 JSON으로 저장
         visualizer.save_blocks_to_json(original_blocks, "./output/blocks_original.json")
         print(f"원본 블록 {len(original_blocks)}개가 blocks_original.json에 저장되었습니다.")
         
-        # 병합된 블록 추출
-        merged_blocks = visualizer.extract_blocks(merge_blocks=True, merge_overlapping=True, apply_exclusions=True)
+        # 원본 블록 시각화 (어노테이션 없이)
+        visualizer.visualize_blocks(output_dir, blocks=original_blocks, suffix="_original", is_original=True)
+        print(f"원본 블록의 바운딩 박스가 {output_dir} 디렉토리에 저장되었습니다.")
+        
+        # 병합 및 어노테이션된 블록 추출
+        merged_blocks = visualizer.extract_blocks(merge_blocks=True, merge_overlapping=True)
         
         # 블록 유형 통계 출력
         block_type_count = {}
@@ -684,8 +657,9 @@ def main():
         # 병합된 블록 JSON으로 저장
         visualizer.save_blocks_to_json(merged_blocks, "./output/blocks_merged.json")
         
-        # 시각화 (블록 유형별로 다른 색상 적용)
-        visualizer.visualize_blocks(output_dir, show_exclude_boxes=True)
+        # 병합된 블록 시각화 (어노테이션 적용)
+        visualizer.visualize_blocks(output_dir, blocks=merged_blocks, suffix="_merged")
+        print(f"병합된 블록의 바운딩 박스가 {output_dir} 디렉토리에 저장되었습니다.")
         
         print(f"총 {len(merged_blocks)}개의 병합된 텍스트 블록을 추출했습니다.")
         print(f"결과가 {output_dir} 디렉토리에 저장되었습니다.")
