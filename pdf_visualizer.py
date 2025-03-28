@@ -413,7 +413,7 @@ class PDFVisualizer:
             page = self.doc[page_num]
             blocks_dict = page.get_text("dict")["blocks"]
             
-            for block in blocks_dict:
+            for block_idx, block in enumerate(blocks_dict):
                 if "lines" not in block:
                     continue
                 
@@ -430,7 +430,10 @@ class PDFVisualizer:
                 if text_parts and first_span:
                     text = " ".join(text_parts).strip()
                     if text:
+                        # 고유 ID 생성: 페이지번호_블록인덱스
+                        block_id = f"p{page_num + 1}_b{block_idx}"
                         block_info = {
+                            "id": block_id,
                             "page": page_num + 1,
                             "text": text,
                             "bbox": block["bbox"],
@@ -452,6 +455,7 @@ class PDFVisualizer:
             
             merged_blocks = []
             current = all_blocks[0].copy()
+            merged_ids = [current["id"]]  # 병합된 블록의 ID 목록
             
             for next_block in all_blocks[1:]:
                 if self._should_merge_blocks(current, next_block):
@@ -464,11 +468,21 @@ class PDFVisualizer:
                         max(current["bbox"][2], next_block["bbox"][2]),
                         max(current["bbox"][3], next_block["bbox"][3])
                     )
+                    # ID 목록에 추가
+                    merged_ids.append(next_block["id"])
+                    # 병합된 블록 ID 목록 저장
+                    current["merged_ids"] = merged_ids
                 else:
                     merged_blocks.append(current)
                     current = next_block.copy()
+                    merged_ids = [current["id"]]
+                    current["merged_ids"] = merged_ids
             
             merged_blocks.append(current)
+            
+            # 블록 ID 재할당
+            for idx, block in enumerate(merged_blocks):
+                block["id"] = f"m{idx+1}"  # 병합된 블록의 새 ID
             
             # 겹치는 블록 병합
             if merge_overlapping:
@@ -490,6 +504,9 @@ class PDFVisualizer:
                             max(merged_blocks[i]["bbox"][2], merged_blocks[i+1]["bbox"][2]),
                             max(merged_blocks[i]["bbox"][3], merged_blocks[i+1]["bbox"][3])
                         )
+                        
+                        # 병합 ID 정보 업데이트
+                        merged_blocks[i]["merged_ids"].extend(merged_blocks[i+1].get("merged_ids", [merged_blocks[i+1]["id"]]))
                         
                         # 병합된 블록 제거
                         merged_blocks.pop(i+1)
@@ -539,6 +556,11 @@ class PDFVisualizer:
                         # 원본 블록은 모두 동일한 색상(초록색)으로 표시
                         color = (0, 0.7, 0)
                         page.draw_rect(rect, color=color, width=1)
+                        
+                        # ID 표시
+                        id_point = fitz.Point(rect.x0, rect.y0 - 5)
+                        page.insert_text(id_point, block["id"], 
+                                        color=color, fontsize=7)
                     else:
                         # 병합된 블록은 유형에 따라 색상 결정
                         block_type = block["block_type"]
@@ -547,13 +569,27 @@ class PDFVisualizer:
                         # 제목이 우선순위가 높음
                         if block["is_title"]:
                             color = self.block_types["title"]
-                            
+                        
                         page.draw_rect(rect, color=color)
                         
-                        # 블럭 유형 표시 (병합된 블록에만 적용)
-                        text_point = fitz.Point(rect.x0, rect.y0 - 2)
-                        page.insert_text(text_point, block_type, 
-                                        color=color, fontsize=6)
+                        # ID와 블럭 유형 표시
+                        id_point = fitz.Point(rect.x0, rect.y0 - 5)
+                        type_point = fitz.Point(rect.x0 + 50, rect.y0 - 5)  # ID와 나란히 표시
+                        
+                        page.insert_text(id_point, f"[{block['id']}]", 
+                                        color=color, fontsize=7)
+                        page.insert_text(type_point, block_type, 
+                                        color=color, fontsize=7)
+                        
+                        # 병합된 ID 리스트가 있으면 표시
+                        if "merged_ids" in block and len(block["merged_ids"]) > 1:
+                            merged_ids_str = f"Merged: {', '.join(block['merged_ids'][:3])}"
+                            if len(block["merged_ids"]) > 3:
+                                merged_ids_str += f"... +{len(block['merged_ids']) - 3}"
+                            
+                            merged_point = fitz.Point(rect.x0, rect.y0 - 12)  # ID 위에 표시
+                            page.insert_text(merged_point, merged_ids_str, 
+                                            color=(0.5, 0.5, 0.5), fontsize=6)
             
             # 바운딩 박스가 그려진 이미지 저장 (접미사 추가)
             file_name = f"page_{page_num + 1}_with_boxes{suffix}.png"
@@ -588,7 +624,7 @@ class PDFVisualizer:
             page = self.doc[page_num]
             blocks_dict = page.get_text("dict")["blocks"]
             
-            for block in blocks_dict:
+            for block_idx, block in enumerate(blocks_dict):
                 if "lines" not in block:
                     continue
                 
@@ -605,7 +641,10 @@ class PDFVisualizer:
                 if text_parts and first_span:
                     text = " ".join(text_parts).strip()
                     if text:
+                        # 고유 ID 생성: 페이지번호_블록인덱스
+                        block_id = f"p{page_num + 1}_b{block_idx}"
                         block_info = {
+                            "id": block_id,
                             "page": page_num + 1,
                             "text": text,
                             "bbox": block["bbox"],
@@ -619,6 +658,200 @@ class PDFVisualizer:
     def close(self):
         """PDF 문서 닫기"""
         self.doc.close()
+
+class DocumentPatternRecognizer:
+    """다양한 문서 유형별 패턴 인식을 위한 클래스"""
+    
+    def __init__(self):
+        # 문서 유형 분류를 위한 패턴 사전
+        self.document_type_patterns = {
+            '법률문서': [
+                r'(?:소득|조특|법인|부가가치|상속|증여)(?:법|령)\s+제\d+조',
+                r'(?:민법|형법|상법|헌법|행정\s*절차법|국세\s*기본법)',
+                r'(?:대법원|헌법재판소).*?(?:판결|결정)'
+            ],
+            '금융문서': [
+                r'(?:예금|적금|펀드|투자|주식|채권|상품|계좌)',
+                r'(?:이율|수익률|금리)\s*(?:\d+(?:\.\d+)?)\s*%',
+                r'(?:만기일|만기금액|원금|이자)'
+            ],
+            '의학문서': [
+                r'(?:진단|처방|투약|용법|용량|부작용)',
+                r'(?:환자|의사|간호사|병원|약국)',
+                r'(?:수술|치료|검사|예방|예후)'
+            ],
+            '기술문서': [
+                r'(?:시스템|모듈|인터페이스|프로토콜|API)',
+                r'(?:설계|구현|테스트|배포|유지보수)',
+                r'(?:버전|릴리스|업데이트)'
+            ],
+            '학술문서': [
+                r'(?:연구|실험|분석|조사|관찰)',
+                r'(?:참고문헌|인용|출처)',
+                r'(?:가설|이론|모델|방법론)'
+            ],
+            '계약문서': [
+                r'(?:계약서|약관|당사자|갑|을|계약기간)',
+                r'(?:제\d+\s*조|위약금|해지|해제|배상)',
+                r'(?:서명|날인|입회인|증인)'
+            ]
+        }
+        
+        # 문서 내 특정 요소 패턴 정의
+        self.element_patterns = {
+            '법률_참조': [
+                r'(?:제\d+조(?:\s*제\d+항)?(?:\s*제\d+호)?)',
+                r'(?:「|｢)[^」｣]+(?:법|법률|조례|규칙)(?:」|｣)',
+                r'(?:대법원|헌법재판소|행정법원).*?\d{4}[년\.]\s*\d{1,2}[월\.]\s*\d{1,2}[일\.]'
+            ],
+            '금액_표시': [
+                r'\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:원|만원|억원|조원)',
+                r'(?:금|￦|\\)\s*\d{1,3}(?:,\d{3})*(?:\.\d+)?',
+                r'\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:달러|유로|엔|위안)'
+            ],
+            '날짜_표시': [
+                r'\d{4}[년\.]\s*\d{1,2}[월\.]\s*\d{1,2}[일\.]',
+                r'\d{4}[-/.]\d{1,2}[-/.]\d{1,2}',
+                r'(?:오늘|내일|어제|당일|익일|전일|다음날|지난날)'
+            ],
+            '적용시기_표시': [
+                r'적용(?:시기|일|기간|대상|범위)(?:\s*:|\s*은)',
+                r'(?:<적용시기.*?>)',
+                r'(?:\d{4}[년\.]\s*\d{1,2}[월\.]\s*\d{1,2}[일\.])\s*(?:부터|이후)'
+            ],
+            '표_구분': [
+                r'(?:표|테이블|Table)\s*\d+[\.\-:]',
+                r'[\|┃│](?:[^│\|┃]+[\|┃│]){2,}',
+                r'(?:-{3,}[\+\-]{3,}-{3,})'
+            ],
+            '목차_항목': [
+                r'^\s*\d+\.\s+[가-힣A-Za-z]',
+                r'^\s*[IVXLCDM]+\.\s+[가-힣A-Za-z]',
+                r'^\s*[가-힣]\.\s+[가-힣A-Za-z]'
+            ],
+            '참조_표시': [
+                r'(?:\*|※|주\)|각주)\s*\d*\s*:',
+                r'\[\s*\d+\s*\]',
+                r'(?:참고|참조|관련)\s*:?'
+            ]
+        }
+        
+        # 문서 유형별 중요 섹션 패턴
+        self.section_patterns = {
+            '법률문서': {
+                '제목': [r'^제\d+\s*장\s+[가-힣A-Za-z]', r'^제\d+\s*절\s+[가-힣A-Za-z]'],
+                '본문': [r'^제\d+\s*조\s+\([가-힣A-Za-z]+\)', r'^\d+\.\s+[가-힣A-Za-z]'],
+                '부칙': [r'^부\s*칙', r'제\d+\s*조\s*\(시행일\)']
+            },
+            '금융문서': {
+                '상품정보': [r'(?:상품|펀드|예금)\s*(?:정보|개요|안내)', r'(?:금리|이율)\s*(?:정보|안내)'],
+                '거래조건': [r'(?:거래|계약)\s*(?:조건|정보|방법)', r'(?:수수료|비용)\s*(?:정보|안내)'],
+                '유의사항': [r'(?:유의|주의)\s*(?:사항|안내)', r'(?:위험|리스크)\s*(?:고지|안내)']
+            },
+            '계약문서': {
+                '당사자': [r'(?:계약|협약)\s*(?:당사자|주체)', r'제\d+\s*조\s*\(당사자\)'],
+                '계약내용': [r'(?:계약|협약)\s*(?:내용|범위|대상)', r'제\d+\s*조\s*\(계약내용\)'],
+                '계약기간': [r'(?:계약|협약)\s*(?:기간|일정|종료)', r'제\d+\s*조\s*\(계약기간\)'],
+                '해지조항': [r'(?:계약|협약)\s*(?:해지|해제|종료)', r'제\d+\s*조\s*\(계약해지\)']
+            }
+        }
+    
+    def detect_document_type(self, text):
+        """문서 유형 탐지"""
+        type_scores = {}
+        
+        for doc_type, patterns in self.document_type_patterns.items():
+            score = 0
+            for pattern in patterns:
+                matches = re.findall(pattern, text)
+                score += len(matches) * 2  # 가중치 적용
+            type_scores[doc_type] = score
+        
+        # 가장 높은 점수의 문서 유형 반환 (임계값 적용)
+        best_type = max(type_scores.items(), key=lambda x: x[1])
+        if best_type[1] >= 3:  # 최소 패턴 매칭 임계값
+            return best_type[0]
+        return "일반문서"  # 기본 유형
+    
+    def extract_elements(self, text, element_types=None):
+        """문서에서 특정 요소 추출"""
+        results = {}
+        
+        # 추출할 요소 유형 필터링
+        if element_types:
+            patterns_to_check = {k: v for k, v in self.element_patterns.items() if k in element_types}
+        else:
+            patterns_to_check = self.element_patterns
+        
+        # 패턴별 요소 추출
+        for element_type, patterns in patterns_to_check.items():
+            elements = []
+            for pattern in patterns:
+                matches = re.finditer(pattern, text)
+                for match in matches:
+                    elements.append({
+                        'text': match.group(0),
+                        'span': (match.start(), match.end()),
+                        'pattern': pattern
+                    })
+            results[element_type] = elements
+        
+        return results
+    
+    def detect_sections(self, text, document_type):
+        """문서 유형에 맞는 섹션 탐지"""
+        if document_type not in self.section_patterns:
+            return {}
+        
+        sections = {}
+        section_patterns = self.section_patterns[document_type]
+        
+        for section_name, patterns in section_patterns.items():
+            section_spans = []
+            for pattern in patterns:
+                for match in re.finditer(pattern, text, re.MULTILINE):
+                    # 섹션 제목과 시작 위치 저장
+                    section_spans.append({
+                        'title': match.group(0),
+                        'start': match.start()
+                    })
+            
+            if section_spans:
+                # 시작 위치로 정렬
+                section_spans.sort(key=lambda x: x['start'])
+                sections[section_name] = section_spans
+        
+        return sections
+    
+    def is_continuation(self, text1, text2):
+        """두 텍스트 블록이 연결되어 있는지 판단"""
+        # 법률 참조 형식
+        if re.match(r'^\((?:소득|조특|법인|부가가치|상속|증여)(?:법|령)\s+제\d+조', text2):
+            return True
+            
+        # 적용시기 형식
+        if text2.startswith("적용시기") or text2.startswith("<적용시기"):
+            return True
+            
+        # 문장 연결 패턴 (이어지는 문장)
+        if text1.rstrip().endswith(('다만', '그러나', '하지만', '또한', ',', '.', ':')):
+            return True
+            
+        # 번호 항목 연속성
+        if re.match(r'^\s*\d+\.\s+', text1) and re.match(r'^\s*\d+\.\s+', text2):
+            num1 = int(re.match(r'^\s*(\d+)\.', text1).group(1))
+            num2 = int(re.match(r'^\s*(\d+)\.', text2).group(1))
+            if num2 == num1 + 1:
+                return True
+                
+        # 한글 목차 연속성
+        if re.match(r'^\s*[가-힣]\.\s+', text1) and re.match(r'^\s*[가-힣]\.\s+', text2):
+            char1 = re.match(r'^\s*([가-힣])\.', text1).group(1)
+            char2 = re.match(r'^\s*([가-힣])\.', text2).group(1)
+            if ord(char2) == ord(char1) + 1:
+                return True
+        
+        return False
 
 def main():
     # 예시 사용법
